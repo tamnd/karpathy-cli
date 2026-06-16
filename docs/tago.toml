@@ -1,0 +1,10 @@
+title       = "karpathy"
+baseURL     = "https://karpathy-cli.tamnd.com/"
+description = "Browse Andrej Karpathy's blog from the command line."
+contentDir  = "content"
+outputDir   = "public"
+theme       = "tago-doks"
+syntaxHighlight = "true"
+
+[params]
+github = "https://github.com/tamnd/karpathy-cli"
