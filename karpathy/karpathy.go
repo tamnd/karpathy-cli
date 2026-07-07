@@ -1,62 +1,335 @@
 // Package karpathy is the library behind the karpathy command line:
-// the HTTP client, request shaping, and the typed data models for karpathy.
+// the HTTP client, RSS feed parsing, and typed data models for
+// Andrej Karpathy's blog at karpathy.github.io.
 //
-// The Client here is the spine every command shares. It sets a real
+// The Client is the spine every command shares. It sets a real
 // User-Agent, paces requests so a busy session stays polite, and retries the
 // transient failures (429 and 5xx) that any public site throws under load.
-// Build your endpoint calls and JSON decoding on top of it.
 package karpathy
 
 import (
 	"context"
+	"encoding/xml"
 	"fmt"
+	"html"
 	"io"
 	"net/http"
+	"net/url"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 )
 
-// DefaultUserAgent identifies the client to karpathy. A real, honest
-// User-Agent is both polite and the thing most likely to keep you unblocked.
+// DefaultUserAgent identifies the client to the blog server.
 const DefaultUserAgent = "karpathy/dev (+https://github.com/tamnd/karpathy-cli)"
 
-// Host is the site this client talks to, and the host the URI driver in
-// domain.go claims. The scaffold points it at karpathy.github.io; change it once you
-// know the real endpoints you want to read.
+// Host is the site this client talks to.
 const Host = "karpathy.github.io"
 
 // BaseURL is the root every request is built from.
 const BaseURL = "https://" + Host
 
-// Client talks to karpathy over HTTP.
-type Client struct {
-	HTTP      *http.Client
+// Config holds tuneable parameters for a Client.
+type Config struct {
+	BaseURL   string
+	FeedPath  string
 	UserAgent string
-	// Rate is the minimum gap between requests. Zero means no pacing.
-	Rate    time.Duration
-	Retries int
-
-	last time.Time
+	Rate      time.Duration
+	Timeout   time.Duration
+	Retries   int
 }
 
-// NewClient returns a Client with sensible defaults: a 30s timeout, a 200ms
-// minimum gap between requests, and five retries on transient errors.
-func NewClient() *Client {
-	return &Client{
-		HTTP:      &http.Client{Timeout: 30 * time.Second},
+// DefaultConfig returns a Config with polite defaults.
+func DefaultConfig() Config {
+	return Config{
+		BaseURL:   BaseURL,
+		FeedPath:  "/feed.xml",
 		UserAgent: DefaultUserAgent,
-		Rate:      200 * time.Millisecond,
-		Retries:   5,
+		Rate:      300 * time.Millisecond,
+		Timeout:   30 * time.Second,
+		Retries:   3,
 	}
 }
 
-// Get fetches url and returns the response body. It paces and retries according
-// to the client's settings. The caller owns nothing extra; the body is read
-// fully and closed here.
-func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
+// Client talks to karpathy.github.io over HTTP.
+type Client struct {
+	cfg  Config
+	http *http.Client
+	mu   sync.Mutex
+	last time.Time
+}
+
+// NewClient returns a Client configured from cfg.
+func NewClient(cfg Config) *Client {
+	return &Client{
+		cfg:  cfg,
+		http: &http.Client{Timeout: cfg.Timeout},
+	}
+}
+
+// Post is a single blog post entry.
+type Post struct {
+	Rank    int    `json:"rank"`
+	Title   string `json:"title"`
+	Date    string `json:"date"`
+	Slug    string `json:"slug"`
+	Summary string `json:"summary"`
+	URL     string `json:"url"`
+}
+
+// PostDetail augments Post with sections and links from the post page.
+type PostDetail struct {
+	Title    string `json:"title"`
+	Date     string `json:"date"`
+	Slug     string `json:"slug"`
+	Summary  string `json:"summary"`
+	Sections string `json:"sections"`
+	Links    string `json:"links"`
+	URL      string `json:"url"`
+}
+
+// Info holds aggregate blog statistics.
+type Info struct {
+	TotalPosts int    `json:"total_posts"`
+	FirstPost  string `json:"first_post"`
+	LatestPost string `json:"latest_post"`
+	FeedURL    string `json:"feed_url"`
+	SiteURL    string `json:"site_url"`
+}
+
+// rss2Feed is the RSS 2.0 wire format.
+type rss2Feed struct {
+	Channel struct {
+		Items []rss2Item `xml:"item"`
+	} `xml:"channel"`
+}
+
+type rss2Item struct {
+	Title       string `xml:"title"`
+	Link        string `xml:"link"`
+	PubDate     string `xml:"pubDate"`
+	Description string `xml:"description"`
+}
+
+// Posts fetches the RSS feed and returns up to limit posts, newest first.
+// limit <= 0 returns all posts in the feed.
+func (c *Client) Posts(ctx context.Context, limit int) ([]Post, error) {
+	feedURL := c.cfg.BaseURL + c.cfg.FeedPath
+	body, err := c.get(ctx, feedURL)
+	if err != nil {
+		return nil, fmt.Errorf("fetch feed: %w", err)
+	}
+	return parsePosts(body, limit)
+}
+
+// Post fetches a single blog post by slug or URL.
+func (c *Client) Post(ctx context.Context, slug string) (*PostDetail, error) {
+	// Resolve slug to URL via the feed
+	postURL, err := c.resolveSlug(ctx, slug)
+	if err != nil {
+		return nil, err
+	}
+	body, err := c.get(ctx, postURL)
+	if err != nil {
+		return nil, err
+	}
+	return parsePostPage(body, postURL)
+}
+
+// Stats returns aggregate statistics from the RSS feed.
+func (c *Client) Stats(ctx context.Context) (*Info, error) {
+	posts, err := c.Posts(ctx, 0)
+	if err != nil {
+		return nil, err
+	}
+	info := &Info{
+		TotalPosts: len(posts),
+		FeedURL:    c.cfg.BaseURL + c.cfg.FeedPath,
+		SiteURL:    c.cfg.BaseURL,
+	}
+	if len(posts) > 0 {
+		info.LatestPost = posts[0].Date
+		info.FirstPost = posts[len(posts)-1].Date
+	}
+	return info, nil
+}
+
+// resolveSlug finds the full URL for a slug/path/URL in the RSS feed.
+func (c *Client) resolveSlug(ctx context.Context, input string) (string, error) {
+	// If it looks like a full URL, use it directly
+	if strings.HasPrefix(input, "http://") || strings.HasPrefix(input, "https://") {
+		return input, nil
+	}
+	posts, err := c.Posts(ctx, 0)
+	if err != nil {
+		return "", err
+	}
+	// Try exact slug match
+	for _, p := range posts {
+		if p.Slug == input {
+			return p.URL, nil
+		}
+	}
+	// Try suffix match (partial path)
+	for _, p := range posts {
+		if strings.HasSuffix(strings.TrimSuffix(p.URL, "/"), "/"+input) {
+			return p.URL, nil
+		}
+	}
+	return "", fmt.Errorf("post not found: %s", input)
+}
+
+// parsePosts parses an RSS 2.0 body into Post records.
+func parsePosts(body []byte, limit int) ([]Post, error) {
+	var feed rss2Feed
+	if err := xml.Unmarshal(body, &feed); err != nil {
+		return nil, fmt.Errorf("parse feed: %w", err)
+	}
+	items := feed.Channel.Items
+	if limit > 0 && len(items) > limit {
+		items = items[:limit]
+	}
+	posts := make([]Post, 0, len(items))
+	for i, it := range items {
+		link := strings.TrimSpace(it.Link)
+		posts = append(posts, Post{
+			Rank:    i + 1,
+			Title:   cleanText(it.Title),
+			Date:    parseDate(it.PubDate),
+			Slug:    slugFromURL(link),
+			Summary: cleanSummary(it.Description),
+			URL:     link,
+		})
+	}
+	return posts, nil
+}
+
+// parsePostPage extracts PostDetail from a post HTML page.
+func parsePostPage(body []byte, postURL string) (*PostDetail, error) {
+	s := string(body)
+	slug := slugFromURL(postURL)
+	// Extract title from <h1>
+	title := ""
+	if m := reH1.FindStringSubmatch(s); m != nil {
+		title = strings.TrimSpace(cleanText(m[1]))
+	}
+	// Extract date
+	date := ""
+	if m := reDateMeta.FindStringSubmatch(s); m != nil {
+		date = parseDate(m[1])
+	}
+	// Extract first paragraph as summary
+	summary := ""
+	if m := reFirstP.FindStringSubmatch(s); m != nil {
+		summary = cleanSummary(m[1])
+		if len(summary) > 500 {
+			summary = summary[:499] + "..."
+		}
+	}
+	return &PostDetail{
+		Title:    title,
+		Date:     date,
+		Slug:     slug,
+		Summary:  summary,
+		Sections: extractSections(s),
+		Links:    extractLinks(s),
+		URL:      postURL,
+	}, nil
+}
+
+var (
+	reTag     = regexp.MustCompile(`<[^>]+>`)
+	reH1      = regexp.MustCompile(`(?i)<h1[^>]*>(.*?)</h1>`)
+	reH2      = regexp.MustCompile(`(?i)<h2[^>]*>(.*?)</h2>`)
+	reFirstP  = regexp.MustCompile(`(?s)<p[^>]*>(.*?)</p>`)
+	reDateMeta = regexp.MustCompile(`(?i)<meta[^>]+property="article:published_time"[^>]+content="([^"]+)"`)
+	reLinkHref = regexp.MustCompile(`href="(https?://[^"]+)"`)
+)
+
+// extractSections extracts h2 headings from HTML.
+func extractSections(s string) string {
+	var secs []string
+	for _, m := range reH2.FindAllStringSubmatch(s, -1) {
+		t := strings.TrimSpace(cleanText(m[1]))
+		if t != "" {
+			secs = append(secs, t)
+		}
+	}
+	return strings.Join(secs, ";")
+}
+
+// extractLinks extracts external links from HTML.
+func extractLinks(s string) string {
+	seen := map[string]bool{}
+	var links []string
+	for _, m := range reLinkHref.FindAllStringSubmatch(s, -1) {
+		href := m[1]
+		if !seen[href] {
+			seen[href] = true
+			links = append(links, href)
+		}
+	}
+	return strings.Join(links, ";")
+}
+
+// slugFromURL extracts the last path segment from a URL.
+func slugFromURL(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return ""
+	}
+	parts := strings.Split(strings.Trim(u.Path, "/"), "/")
+	if len(parts) == 0 {
+		return ""
+	}
+	return parts[len(parts)-1]
+}
+
+// cleanSummary strips HTML and truncates.
+func cleanSummary(s string) string {
+	s = reTag.ReplaceAllString(s, " ")
+	s = html.UnescapeString(s)
+	s = strings.Join(strings.Fields(s), " ")
+	if len(s) > 200 {
+		s = s[:199] + "..."
+	}
+	return s
+}
+
+// cleanText decodes HTML entities and trims space.
+func cleanText(s string) string {
+	s = reTag.ReplaceAllString(s, "")
+	return strings.TrimSpace(html.UnescapeString(s))
+}
+
+// parseDate parses an RSS date string to YYYY-MM-DD.
+func parseDate(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return ""
+	}
+	for _, layout := range []string{
+		time.RFC1123Z,
+		time.RFC1123,
+		"Mon, 2 Jan 2006 15:04:05 -0700",
+		"Mon, 02 Jan 2006 15:04:05 -0700",
+		"Mon, 2 Jan 2006 15:04:05 +0000",
+	} {
+		if t, err := time.Parse(layout, s); err == nil {
+			return t.Format("2006-01-02")
+		}
+	}
+	if len(s) >= 10 {
+		return s[:10]
+	}
+	return s
+}
+
+// get fetches a URL with pacing and retries.
+func (c *Client) get(ctx context.Context, rawURL string) ([]byte, error) {
 	var lastErr error
-	for attempt := 0; attempt <= c.Retries; attempt++ {
+	for attempt := 0; attempt <= c.cfg.Retries; attempt++ {
 		if attempt > 0 {
 			select {
 			case <-ctx.Done():
@@ -64,7 +337,7 @@ func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
 			case <-time.After(backoff(attempt)):
 			}
 		}
-		body, retry, err := c.do(ctx, url)
+		body, retry, err := c.do(ctx, rawURL)
 		if err == nil {
 			return body, nil
 		}
@@ -73,18 +346,18 @@ func (c *Client) Get(ctx context.Context, url string) ([]byte, error) {
 			return nil, err
 		}
 	}
-	return nil, fmt.Errorf("get %s: %w", url, lastErr)
+	return nil, fmt.Errorf("get %s: %w", rawURL, lastErr)
 }
 
-func (c *Client) do(ctx context.Context, url string) (body []byte, retry bool, err error) {
+func (c *Client) do(ctx context.Context, rawURL string) (body []byte, retry bool, err error) {
 	c.pace()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
 		return nil, false, err
 	}
-	req.Header.Set("User-Agent", c.UserAgent)
+	req.Header.Set("User-Agent", c.cfg.UserAgent)
 
-	resp, err := c.HTTP.Do(req)
+	resp, err := c.http.Do(req)
 	if err != nil {
 		return nil, true, err
 	}
@@ -104,13 +377,13 @@ func (c *Client) do(ctx context.Context, url string) (body []byte, retry bool, e
 	return b, false, nil
 }
 
-// pace blocks until at least Rate has passed since the previous request.
 func (c *Client) pace() {
-	if c.Rate <= 0 {
-		return
-	}
-	if wait := c.Rate - time.Since(c.last); wait > 0 {
-		time.Sleep(wait)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.cfg.Rate > 0 {
+		if wait := c.cfg.Rate - time.Since(c.last); wait > 0 {
+			time.Sleep(wait)
+		}
 	}
 	c.last = time.Now()
 }
@@ -121,80 +394,4 @@ func backoff(attempt int) time.Duration {
 		d = 5 * time.Second
 	}
 	return d
-}
-
-// Page is the scaffold's one example record: a single page, addressed by the
-// path that names it on karpathy.github.io. It is a stand-in for the typed records you
-// will model from the real karpathy endpoints. The kit struct tags make it
-// addressable as a resource URI (see domain.go): ID is the URI id, and Body is
-// the long text `karpathy cat` and the Markdown export print.
-type Page struct {
-	ID    string `json:"id" kit:"id"`
-	URL   string `json:"url"`
-	Title string `json:"title,omitempty"`
-	Body  string `json:"body,omitempty" kit:"body"`
-}
-
-// GetPage fetches one page by its path (for example "wiki/Go") and returns it as
-// a record. The scaffold keeps a plain-text preview of the response as the body;
-// replace the parsing with the real fields once you know the endpoint's shape.
-func (c *Client) GetPage(ctx context.Context, path string) (*Page, error) {
-	path = strings.Trim(path, "/")
-	url := BaseURL + "/" + path
-	body, err := c.Get(ctx, url)
-	if err != nil {
-		return nil, err
-	}
-	return &Page{ID: path, URL: url, Title: path, Body: pageText(body)}, nil
-}
-
-// PageLinks fetches a page and returns the same-host pages it links to, as page
-// stubs. It shows the member-listing pattern the URI driver relies on: every
-// stub carries enough (an id and a URL) to be addressed and followed on its own.
-func (c *Client) PageLinks(ctx context.Context, path string, limit int) ([]*Page, error) {
-	path = strings.Trim(path, "/")
-	body, err := c.Get(ctx, BaseURL+"/"+path)
-	if err != nil {
-		return nil, err
-	}
-	var out []*Page
-	seen := map[string]bool{}
-	for _, p := range linkPaths(body) {
-		if seen[p] {
-			continue
-		}
-		seen[p] = true
-		out = append(out, &Page{ID: p, URL: BaseURL + "/" + p})
-		if limit > 0 && len(out) >= limit {
-			break
-		}
-	}
-	return out, nil
-}
-
-var (
-	hrefRE = regexp.MustCompile(`href="(/[^":#?]+)"`)
-	tagRE  = regexp.MustCompile(`<[^>]+>`)
-)
-
-// linkPaths pulls the relative link targets out of an HTML response, so a list
-// op can turn each into an addressable page stub.
-func linkPaths(body []byte) []string {
-	var out []string
-	for _, m := range hrefRE.FindAllSubmatch(body, -1) {
-		if p := strings.Trim(string(m[1]), "/"); p != "" {
-			out = append(out, p)
-		}
-	}
-	return out
-}
-
-// pageText reduces an HTML response to a short plain-text preview, a stand-in
-// for the typed extract a real endpoint would hand you.
-func pageText(body []byte) string {
-	s := strings.Join(strings.Fields(tagRE.ReplaceAllString(string(body), " ")), " ")
-	if len(s) > 500 {
-		s = s[:500]
-	}
-	return s
 }
